@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,6 +68,54 @@ func main() {
 						return fmt.Errorf("please specify a file to delete")
 					}
 					return deleteFile(c.Args().Get(0))
+				},
+			},
+			{
+				Name:    "cleanup-advice",
+				Aliases: []string{"ca"},
+				Usage:   "Analyze directory and provide file deletion recommendations",
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "age",
+						Value: 90,
+						Usage: "Age threshold in days for old file detection",
+					},
+					&cli.IntFlag{
+						Name:  "size",
+						Value: 100,
+						Usage: "Size threshold in MB for large file detection",
+					},
+				},
+				Action: func(c *cli.Context) error {
+					path := "."
+					if c.NArg() > 0 {
+						path = c.Args().Get(0)
+					}
+					return provideCleanupAdvice(path, c.Int("age"), c.Int("size"))
+				},
+			},
+			{
+				Name:    "find-duplicates",
+				Aliases: []string{"fd"},
+				Usage:   "Find duplicate files in a directory",
+				Action: func(c *cli.Context) error {
+					path := "."
+					if c.NArg() > 0 {
+						path = c.Args().Get(0)
+					}
+					return findDuplicateFiles(path)
+				},
+			},
+			{
+				Name:    "disk-usage",
+				Aliases: []string{"du"},
+				Usage:   "Analyze disk usage in a directory",
+				Action: func(c *cli.Context) error {
+					path := "."
+					if c.NArg() > 0 {
+						path = c.Args().Get(0)
+					}
+					return analyzeDiskUsage(path)
 				},
 			},
 			{
@@ -182,6 +234,9 @@ func runInteractiveMode() error {
 		fmt.Println("5. Add directory to monitored list")
 		fmt.Println("6. Remove directory from monitored list")
 		fmt.Println("7. Monitor all saved directories")
+		fmt.Println("8. Get cleanup advice")
+		fmt.Println("9. Find duplicate files")
+		fmt.Println("10. Analyze disk usage")
 		fmt.Println("0. Exit")
 		fmt.Println("=============================")
 		fmt.Print("Enter your choice: ")
@@ -274,7 +329,75 @@ func runInteractiveMode() error {
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			}
+		case "8":
+			fmt.Print("Enter directory path (or press Enter for current directory): ")
+			path, _ := reader.ReadString('\n')
+			path = strings.TrimSpace(path)
+			if path == "" {
+				path = "."
+			}
 
+			fmt.Print("Enter age threshold in days (or press Enter for default 90): ")
+			ageStr, _ := reader.ReadString('\n')
+			ageStr = strings.TrimSpace(ageStr)
+			age := 90
+			if ageStr != "" {
+				if n, err := fmt.Sscanf(ageStr, "%d", &age); n != 1 || err != nil {
+					fmt.Println("Invalid age, using default 90 days")
+					age = 90
+				}
+			}
+
+			fmt.Print("Enter size threshold in MB (or press Enter for default 100): ")
+			sizeStr, _ := reader.ReadString('\n')
+			sizeStr = strings.TrimSpace(sizeStr)
+			size := 100
+			if sizeStr != "" {
+				if n, err := fmt.Sscanf(sizeStr, "%d", &size); n != 1 || err != nil {
+					fmt.Println("Invalid size, using default 100 MB")
+					size = 100
+				}
+			}
+
+			err := provideCleanupAdvice(path, age, size)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+
+			fmt.Println("\nPress Enter to continue...")
+			reader.ReadString('\n')
+
+		case "9":
+			fmt.Print("Enter directory path (or press Enter for current directory): ")
+			path, _ := reader.ReadString('\n')
+			path = strings.TrimSpace(path)
+			if path == "" {
+				path = "."
+			}
+
+			err := findDuplicateFiles(path)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+
+			fmt.Println("\nPress Enter to continue...")
+			reader.ReadString('\n')
+
+		case "10":
+			fmt.Print("Enter directory path (or press Enter for current directory): ")
+			path, _ := reader.ReadString('\n')
+			path = strings.TrimSpace(path)
+			if path == "" {
+				path = "."
+			}
+
+			err := analyzeDiskUsage(path)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+
+			fmt.Println("\nPress Enter to continue...")
+			reader.ReadString('\n')
 		default:
 			fmt.Println("Invalid choice")
 			time.Sleep(1 * time.Second)
@@ -419,6 +542,360 @@ func monitorDirectory(path string) error {
 	return nil
 }
 
+// provideCleanupAdvice analyzes files in a directory and recommends which ones to delete
+func provideCleanupAdvice(path string, ageThreshold, sizeThreshold int) error {
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Cleanup advice for %s:\n", absPath)
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-40s %-15s %-20s %s\n", "FILENAME", "SIZE", "MODIFIED", "REASON")
+	fmt.Println(strings.Repeat("-", 80))
+
+	var totalPotentialSavings int64
+	var recommendedFiles []string
+
+	now := time.Now()
+	ageThresholdDuration := time.Duration(ageThreshold*24) * time.Hour
+	sizeThresholdBytes := int64(sizeThreshold * 1024 * 1024)
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue // Skip directories for now
+		}
+
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+
+		filePath := filepath.Join(path, file.Name())
+		fileAge := now.Sub(info.ModTime())
+		reason := ""
+
+		// Check for temporary or log files
+		if isTempFile(file.Name()) {
+			reason = "Temporary file"
+		} else if isLogFile(file.Name()) {
+			reason = "Log file"
+		} else if fileAge > ageThresholdDuration && info.Size() > 0 {
+			reason = fmt.Sprintf("Not modified for %d days", int(fileAge.Hours()/24))
+		} else if info.Size() > sizeThresholdBytes {
+			reason = fmt.Sprintf("Large file (%s)", formatSize(info.Size()))
+		}
+
+		if reason != "" {
+			fmt.Printf("%-40s %-15s %-20s %s\n",
+				truncateString(file.Name(), 39),
+				formatSize(info.Size()),
+				info.ModTime().Format("2006-01-02"),
+				reason)
+
+			totalPotentialSavings += info.Size()
+			recommendedFiles = append(recommendedFiles, filePath)
+		}
+	}
+
+	if len(recommendedFiles) == 0 {
+		fmt.Println("No files recommended for deletion.")
+		return nil
+	}
+
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("Potential space savings: %s\n", formatSize(totalPotentialSavings))
+
+	fmt.Println("\nWould you like to delete these files? (y/N):")
+	var response string
+	fmt.Scanln(&response)
+
+	if strings.ToLower(response) == "y" || strings.ToLower(response) == "yes" {
+		for _, filePath := range recommendedFiles {
+			if err := os.Remove(filePath); err != nil {
+				fmt.Printf("Error deleting %s: %v\n", filePath, err)
+			} else {
+				fmt.Printf("Deleted: %s\n", filePath)
+			}
+		}
+	}
+
+	return nil
+}
+
+// findDuplicateFiles identifies potential duplicate files in a directory
+func findDuplicateFiles(path string) error {
+	// First pass: get file sizes and organize by size
+	filesBySize := make(map[int64][]string)
+
+	err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			filesBySize[info.Size()] = append(filesBySize[info.Size()], filePath)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	// Second pass: compute MD5 hashes for potential duplicates (files with same size)
+	duplicateGroups := make(map[string][]string)
+
+	for size, files := range filesBySize {
+		if len(files) > 1 && size > 0 {
+			// Files with the same size are potential duplicates
+			for _, file := range files {
+				hash, err := calculateMD5(file)
+				if err != nil {
+					fmt.Printf("Error calculating hash for %s: %v\n", file, err)
+					continue
+				}
+
+				duplicateGroups[hash] = append(duplicateGroups[hash], file)
+			}
+		}
+	}
+
+	// Display results
+	duplicateCount := 0
+	var totalWasted int64
+
+	fmt.Println("Duplicate files:")
+	fmt.Println(strings.Repeat("-", 80))
+
+	for hash, files := range duplicateGroups {
+		if len(files) > 1 {
+			duplicateCount++
+
+			// Get file size (all files in this group have the same size)
+			info, err := os.Stat(files[0])
+			if err != nil {
+				continue
+			}
+
+			// Calculate wasted space
+			wastedSpace := info.Size() * int64(len(files)-1)
+			totalWasted += wastedSpace
+
+			fmt.Printf("\nDuplicate Group %d (%s, wasted: %s):\n",
+				duplicateCount, hash[:8], formatSize(wastedSpace))
+
+			for i, file := range files {
+				fmt.Printf("%d. %s\n", i+1, file)
+			}
+		}
+	}
+
+	if duplicateCount == 0 {
+		fmt.Println("No duplicate files found.")
+		return nil
+	}
+
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("Found %d groups of duplicate files\n", duplicateCount)
+	fmt.Printf("Potential space savings: %s\n", formatSize(totalWasted))
+
+	return nil
+}
+
+// analyzeDiskUsage shows disk usage by file types and directories
+func analyzeDiskUsage(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+
+	// Collect stats by file type and directory
+	typeStats := make(map[string]int64)
+	dirStats := make(map[string]int64)
+
+	var totalSize int64
+
+	err = filepath.Walk(absPath, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip files we can't access
+		}
+
+		// Skip the root directory itself
+		if filePath == absPath {
+			return nil
+		}
+
+		if !info.IsDir() {
+			// Update total size
+			totalSize += info.Size()
+
+			// Update file type stats
+			ext := strings.ToLower(filepath.Ext(filePath))
+			if ext == "" {
+				ext = "[no extension]"
+			}
+			typeStats[ext] += info.Size()
+
+			// Update directory stats (by parent directory)
+			parentDir := filepath.Dir(filePath)
+			dirStats[parentDir] += info.Size()
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	// Display results by file type
+	fmt.Printf("Disk usage analysis for: %s\n\n", absPath)
+	fmt.Println("Usage by file type:")
+	fmt.Println(strings.Repeat("-", 60))
+	fmt.Printf("%-20s %-15s %s\n", "FILE TYPE", "SIZE", "% OF TOTAL")
+	fmt.Println(strings.Repeat("-", 60))
+
+	// Convert to slice for sorting
+	type typeStat struct {
+		ext  string
+		size int64
+	}
+
+	typeStatsList := make([]typeStat, 0, len(typeStats))
+	for ext, size := range typeStats {
+		typeStatsList = append(typeStatsList, typeStat{ext, size})
+	}
+
+	// Sort by size (descending)
+	sort.Slice(typeStatsList, func(i, j int) bool {
+		return typeStatsList[i].size > typeStatsList[j].size
+	})
+
+	for _, stat := range typeStatsList {
+		percentage := float64(stat.size) / float64(totalSize) * 100
+		fmt.Printf("%-20s %-15s %.1f%%\n",
+			stat.ext, formatSize(stat.size), percentage)
+	}
+
+	// Display results by directory
+	fmt.Println("\nLargest directories:")
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Printf("%-50s %-15s\n", "DIRECTORY", "SIZE")
+	fmt.Println(strings.Repeat("-", 70))
+
+	// Convert to slice for sorting
+	type dirStat struct {
+		dir  string
+		size int64
+	}
+
+	dirStatsList := make([]dirStat, 0, len(dirStats))
+	for dir, size := range dirStats {
+		dirStatsList = append(dirStatsList, dirStat{dir, size})
+	}
+
+	// Sort by size (descending)
+	sort.Slice(dirStatsList, func(i, j int) bool {
+		return dirStatsList[i].size > dirStatsList[j].size
+	})
+
+	// Show top 10 directories
+	count := 0
+	for _, stat := range dirStatsList {
+		relPath, err := filepath.Rel(absPath, stat.dir)
+		if err != nil {
+			relPath = stat.dir
+		}
+
+		if relPath == "." {
+			relPath = "[root directory]"
+		}
+
+		fmt.Printf("%-50s %-15s\n",
+			truncateString(relPath, 49), formatSize(stat.size))
+
+		count++
+		if count >= 10 {
+			break
+		}
+	}
+
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Printf("Total size: %s\n", formatSize(totalSize))
+
+	return nil
+}
+
+// Helper functions
+func isTempFile(filename string) bool {
+	lowerName := strings.ToLower(filename)
+	return strings.HasSuffix(lowerName, ".tmp") ||
+		strings.HasSuffix(lowerName, ".temp") ||
+		strings.HasPrefix(lowerName, "~") ||
+		strings.HasPrefix(lowerName, "temp_") ||
+		strings.Contains(lowerName, "cache") ||
+		strings.HasSuffix(lowerName, ".bak")
+}
+
+func isLogFile(filename string) bool {
+	lowerName := strings.ToLower(filename)
+	return strings.HasSuffix(lowerName, ".log") ||
+		strings.HasSuffix(lowerName, ".log.gz") ||
+		strings.HasSuffix(lowerName, ".logs") ||
+		strings.Contains(lowerName, "debug")
+}
+
+func formatSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+func calculateMD5(filePath string) (string, error) {
+	// Open the file
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// Create a new hash
+	hash := md5.New()
+
+	// Copy file content to the hash
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	// Get the hash sum
+	hashInBytes := hash.Sum(nil)
+
+	// Convert to string
+	hashString := hex.EncodeToString(hashInBytes)
+
+	return hashString, nil
+}
 func addDirectory(path string) error {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
